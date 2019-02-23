@@ -115,7 +115,7 @@ func EpollCreate(c *EpollConfig) (*Epoll, error) {
 		waitDone:  make(chan struct{}),
 	}
 
-	// Run wait loop.
+	// Запускаем горутину, которая отслеживает изменения
 	go ep.wait(config.OnWaitError)
 
 	return ep, nil
@@ -166,10 +166,10 @@ func (ep *Epoll) Close() (err error) {
 	return
 }
 
-// Add adds fd to epoll set with given events.
-// Callback will be called on each received event from epoll.
-// Note that _EPOLLCLOSED is triggered for every cb when epoll closed.
+// Add добавляет файловые дескрипторы для отслеживания с помощью epoll
+// Важно! _EPOLLCLOSED вызывается для каждого коллбека когда epoll закрывается
 func (ep *Epoll) Add(fd int, events EpollEvent, cb func(EpollEvent)) (err error) {
+	// Создаем ивент
 	ev := &unix.EpollEvent{
 		Events: uint32(events),
 		Fd:     int32(fd),
@@ -181,15 +181,19 @@ func (ep *Epoll) Add(fd int, events EpollEvent, cb func(EpollEvent)) (err error)
 	if ep.closed {
 		return ErrClosed
 	}
+
+	// Проверяем, не сохранен ли уже коллбек для данного файлового дескриптора
 	if _, has := ep.callbacks[fd]; has {
 		return ErrRegistered
 	}
+	// Сохраняем коллбек
 	ep.callbacks[fd] = cb
 
+	// Подключаем файловый дескриптор к отслеживанию с помощью epoll
 	return unix.EpollCtl(ep.fd, unix.EPOLL_CTL_ADD, fd, ev)
 }
 
-// Del removes fd from epoll set.
+// Del удаляет файловый дескриптор из отслеживания с помощью epoll
 func (ep *Epoll) Del(fd int) (err error) {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
@@ -201,13 +205,16 @@ func (ep *Epoll) Del(fd int) (err error) {
 		return ErrNotRegistered
 	}
 
+	// Удаляем коллбек
 	delete(ep.callbacks, fd)
 
+	// Удаляем файловый дескриптор
 	return unix.EpollCtl(ep.fd, unix.EPOLL_CTL_DEL, fd, nil)
 }
 
-// Mod sets to listen events on fd.
+// Mod изменяет настройки для отслеживания файлового дескриптора
 func (ep *Epoll) Mod(fd int, events EpollEvent) (err error) {
+	// Создаем ивент
 	ev := &unix.EpollEvent{
 		Events: uint32(events),
 		Fd:     int32(fd),
@@ -223,6 +230,7 @@ func (ep *Epoll) Mod(fd int, events EpollEvent) (err error) {
 		return ErrNotRegistered
 	}
 
+	// Изменяем настройки
 	return unix.EpollCtl(ep.fd, unix.EPOLL_CTL_MOD, fd, ev)
 }
 
@@ -232,6 +240,7 @@ const (
 )
 
 func (ep *Epoll) wait(onError func(error)) {
+	// Отложенная функция, которая автоматически закрывает файловый дескриптор epoll и канал завершения работы
 	defer func() {
 		if err := unix.Close(ep.fd); err != nil {
 			onError(err)
@@ -239,10 +248,12 @@ func (ep *Epoll) wait(onError func(error)) {
 		close(ep.waitDone)
 	}()
 
+	// Создаем начальные массивы для событий и коллбеков для цикла
 	events := make([]unix.EpollEvent, maxWaitEventsBegin)
 	callbacks := make([]func(EpollEvent), 0, maxWaitEventsBegin)
 
 	for {
+		// Ждем от системы когда что-то поменяется в отслеживаемых файловых дескрипторах
 		n, err := unix.EpollWait(ep.fd, events, -1)
 		if err != nil {
 			if temporaryErr(err) {
@@ -252,8 +263,10 @@ func (ep *Epoll) wait(onError func(error)) {
 			return
 		}
 
+		// Обновляем размер слайса коллбеков
 		callbacks = callbacks[:n]
 
+		// Получаем коллбеки для обновленных файловых дескрипторов
 		ep.mu.RLock()
 		for i := 0; i < n; i++ {
 			fd := int(events[i].Fd)
@@ -265,6 +278,7 @@ func (ep *Epoll) wait(onError func(error)) {
 		}
 		ep.mu.RUnlock()
 
+		// Вызываем коллбек для каждого обновленного файлового дескриптора
 		for i := 0; i < n; i++ {
 			if cb := callbacks[i]; cb != nil {
 				cb(EpollEvent(events[i].Events))
@@ -272,6 +286,7 @@ func (ep *Epoll) wait(onError func(error)) {
 			}
 		}
 
+		// Расширяем при необходимости массивый элементов если не слезало
 		if n == len(events) && n*2 <= maxWaitEventsStop {
 			events = make([]unix.EpollEvent, n*2)
 			callbacks = make([]func(EpollEvent), 0, n*2)

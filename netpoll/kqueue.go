@@ -220,10 +220,10 @@ func (c *KqueueConfig) withDefaults() (config KqueueConfig) {
 
 // Kqueue represents kqueue instance.
 type Kqueue struct {
-	mu     sync.RWMutex
-	fd     int
-	cb     map[int]KeventHandler
-	done   chan struct{}
+	mu     sync.RWMutex          // Для синхронизации доступа
+	fd     int                   // Файловый дескриптор обработчика
+	cb     map[int]KeventHandler // Коллбеки для отслеживаемых дескрипторов
+	done   chan struct{}         // Канал завершения
 	closed bool
 }
 
@@ -232,6 +232,7 @@ type Kqueue struct {
 func KqueueCreate(c *KqueueConfig) (*Kqueue, error) {
 	config := c.withDefaults()
 
+	// Создаем файловый дескриптор текущего Kqueue
 	fd, err := unix.Kqueue()
 	if err != nil {
 		return nil, err
@@ -243,6 +244,7 @@ func KqueueCreate(c *KqueueConfig) (*Kqueue, error) {
 		done: make(chan struct{}),
 	}
 
+	// Запускаем горутину, которая отслеживает события
 	go kq.wait(config.OnWaitError)
 
 	return kq, nil
@@ -255,13 +257,15 @@ func (k *Kqueue) Close() error {
 	return nil
 }
 
-// Add adds a event handler for identifier fd with given n events.
+// Add добавляет обработчик события для конкретного файлового дескриптора и маски событий
 func (k *Kqueue) Add(fd int, events Kevents, n int, cb KeventHandler) error {
+	// Получаем типы событий
 	var kevs [filterCount]unix.Kevent_t
 	for i := 0; i < n; i++ {
 		kevs[i] = evGet(fd, events[i].Filter, events[i].Flags)
 	}
 
+	// Получаем указатель
 	arr := unsafe.Pointer(&kevs)
 	hdr := &reflect.SliceHeader{
 		Data: uintptr(arr),
@@ -270,23 +274,29 @@ func (k *Kqueue) Add(fd int, events Kevents, n int, cb KeventHandler) error {
 	}
 	changes := *(*[]unix.Kevent_t)(unsafe.Pointer(hdr))
 
+	// Блокировка мьютексом
 	k.mu.Lock()
 	defer k.mu.Unlock()
 
 	if k.closed {
 		return ErrClosed
 	}
+
+	// Проверяем, не сохранен ли уже наш коллбек для данного файлового дескриптора
 	if _, has := k.cb[fd]; has {
 		return ErrRegistered
 	}
+
+	// Сохраняем коллбек
 	k.cb[fd] = cb
 
+	// Подключаемся к событиям
 	_, err := unix.Kevent(k.fd, changes, nil, nil)
 
 	return err
 }
 
-// Mod modifies events registered for fd.
+// Mod модифицирует события привязанные к конкретному дескриптору
 func (k *Kqueue) Mod(fd int, events Kevents, n int) error {
 	var kevs [filterCount]unix.Kevent_t
 	for i := 0; i < n; i++ {
@@ -336,10 +346,13 @@ func (k *Kqueue) Del(fd int) error {
 
 func (k *Kqueue) wait(onError func(error)) {
 	const (
+		// Начальное значение ожидающих файловых дескрипторов
 		maxWaitEventsBegin = 1 << 10 // 1024
-		maxWaitEventsStop  = 1 << 15 // 32768
+		// Максимальное значение ожидающих дескрипторов
+		maxWaitEventsStop = 1 << 15 // 32768
 	)
 
+	// Отложенная функция, которая закрывает файловый дескриптор и закрывает канал
 	defer func() {
 		if err := unix.Close(k.fd); err != nil {
 			onError(err)
@@ -347,10 +360,12 @@ func (k *Kqueue) wait(onError func(error)) {
 		close(k.done)
 	}()
 
+	// Создаем массивы ивентов и коллбеков
 	evs := make([]unix.Kevent_t, maxWaitEventsBegin)
 	cbs := make([]KeventHandler, maxWaitEventsBegin)
 
 	for {
+		// Получаем количество обновленных дескрипторов
 		n, err := unix.Kevent(k.fd, nil, evs, nil)
 		if err != nil {
 			if temporaryErr(err) {
@@ -360,21 +375,24 @@ func (k *Kqueue) wait(onError func(error)) {
 			return
 		}
 
+		// Обновляем размер под нужное нам количество
 		cbs = cbs[:n]
 		k.mu.RLock()
 		for i := 0; i < n; i++ {
-			fd := int(evs[i].Ident)
-			if fd == -1 { //todo
+			fd := int(evs[i].Ident) // Получаем файловый дескриптор в котором изменения были
+			if fd == -1 {           //todo
 				k.mu.RUnlock()
 				return
 			}
-			cbs[i] = k.cb[fd]
+			cbs[i] = k.cb[fd] // Получаем коллбек текущего файлового дескриптора
 		}
 		k.mu.RUnlock()
 
+		// Идем по коллбекам
 		for i, cb := range cbs {
 			if cb != nil {
-				e := evs[i]
+				e := evs[i] // Событие для данного коллбека
+				// Вызываем данный коллбек
 				cb(Kevent{
 					Filter: KeventFilter(e.Filter),
 					Flags:  KeventFlag(e.Flags),
@@ -385,6 +403,7 @@ func (k *Kqueue) wait(onError func(error)) {
 			}
 		}
 
+		// Расширяем массивы при необходимости
 		if n == len(evs) && n*2 <= maxWaitEventsStop {
 			evs = make([]unix.Kevent_t, n*2)
 			cbs = make([]KeventHandler, n*2)
